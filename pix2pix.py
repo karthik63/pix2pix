@@ -42,6 +42,9 @@ parser.add_argument("--lr", type=float, default=0.0002, help="initial learning r
 parser.add_argument("--beta1", type=float, default=0.5, help="momentum term of adam")
 parser.add_argument("--l1_weight", type=float, default=100.0, help="weight on L1 term for generator gradient")
 parser.add_argument("--gan_weight", type=float, default=1.0, help="weight on GAN term for generator gradient")
+parser.add_argument("--if_y", help="set this option to pass attributes", dest="if_y", action="store_true")
+parser.add_argument("--input_size", help="number of images in input", type=int, default="289222")
+parser.set_defaults(if_y=True)
 
 # export options
 parser.add_argument("--output_filetype", default="png", choices=["png", "jpeg"])
@@ -234,98 +237,183 @@ def lab_to_rgb(lab):
 
         return tf.reshape(srgb_pixels, tf.shape(lab))
 
+def load_paths_and_attributes():
+    with open(os.path.join(a.input_dir, 'Anno/list_attr_img.txt'), 'rb') as attributes_file:
+
+        def get_lines(a):
+            for l in a:
+                yield l
+
+        line_gen = get_lines(attributes_file)
+
+        paths = []
+
+        attributes = np.zeros([a.input_size, 1000], dtype=np.int8)
+
+        index = 0
+
+        for line in line_gen:
+
+            print(index)
+
+            line = line.strip().split()
+
+            if index > 1:
+                path = str(line[0])
+                path = path.strip().split('/')
+                path = path[1] + '-' + path[2]
+                attr = np.array(line[1:1001], dtype=np.int8)
+
+                paths.append(path)
+                attributes[index - 2] = attr
+
+            index += 1
+
+        attributes = np.array(attributes, dtype=np.int8)
+        attributes += 1
+        attributes //= 2
+
+        return paths, attributes
 
 def load_examples():
-    if a.input_dir is None or not os.path.exists(a.input_dir):
-        raise Exception("input_dir does not exist")
 
-    input_paths = glob.glob(os.path.join(a.input_dir, "*.jpg"))
-    decode = tf.image.decode_jpeg
-    if len(input_paths) == 0:
-        input_paths = glob.glob(os.path.join(a.input_dir, "*.png"))
-        decode = tf.image.decode_png
+    if a.if_y:
+        if a.input_dir is None or not os.path.exists(a.input_dir):
+            raise Exception("input_dir does not exist")
 
-    if len(input_paths) == 0:
-        raise Exception("input_dir contains no image files")
+        paths, attributes = load_paths_and_attributes()
+        
+        queue = tf.train.slice_input_producer([paths, attributes], shuffle=a.mode == "train")
 
-    def get_name(path):
-        name, _ = os.path.splitext(os.path.basename(path))
-        return name
+        label = queue[1]
+        image_path = queue[0]
 
-    # if the image names are numbers, sort by the value rather than asciibetically
-    # having sorted inputs means that the outputs are sorted in test mode
-    if all(get_name(path).isdigit() for path in input_paths):
-        input_paths = sorted(input_paths, key=lambda path: int(get_name(path)))
-    else:
-        input_paths = sorted(input_paths)
-
-    with tf.name_scope("load_images"):
-        path_queue = tf.train.string_input_producer(input_paths, shuffle=a.mode == "train")
-        reader = tf.WholeFileReader()
-        paths, contents = reader.read(path_queue)
-        raw_input = decode(contents)
-        raw_input = tf.image.convert_image_dtype(raw_input, dtype=tf.float32)
-
-        assertion = tf.assert_equal(tf.shape(raw_input)[2], 3, message="image does not have 3 channels")
-        with tf.control_dependencies([assertion]):
-            raw_input = tf.identity(raw_input)
-
-        raw_input.set_shape([None, None, 3])
+        image_tensor = tf.image.decode_jpeg(image_path)
 
         if a.lab_colorization:
             # load color and brightness from image, no B image exists here
-            lab = rgb_to_lab(raw_input)
+            lab = rgb_to_lab(image_tensor)
             L_chan, a_chan, b_chan = preprocess_lab(lab)
             a_images = tf.expand_dims(L_chan, axis=2)
             b_images = tf.stack([a_chan, b_chan], axis=2)
+
         else:
             # break apart image pair and move to range [-1, 1]
-            width = tf.shape(raw_input)[1] # [height, width, channels]
-            a_images = preprocess(raw_input[:,:width//2,:])
-            b_images = preprocess(raw_input[:,width//2:,:])
+            width = tf.shape(image_tensor)[1]  # [height, width, channels]
+            a_images = preprocess(image_tensor[:, :width // 2, :])
+            b_images = preprocess(image_tensor[:, width // 2:, :])
 
-    if a.which_direction == "AtoB":
-        inputs, targets = [a_images, b_images]
-    elif a.which_direction == "BtoA":
-        inputs, targets = [b_images, a_images]
-    else:
-        raise Exception("invalid direction")
+        if a.which_direction == "AtoB":
+            inputs, targets = [a_images, b_images]
+        elif a.which_direction == "BtoA":
+            inputs, targets = [b_images, a_images]
+        else:
+            raise Exception("invalid direction")
 
-    # synchronize seed for image operations so that we do the same operations to both
-    # input and output images
-    seed = random.randint(0, 2**31 - 1)
-    def transform(image):
-        r = image
-        if a.flip:
-            r = tf.image.random_flip_left_right(r, seed=seed)
+        paths_batch, inputs_batch, targets_batch, label_batch = tf.train.batch([image_path, inputs, targets, label],
+                                                                  batch_size=a.batch_size)
+        steps_per_epoch = int(math.ceil(len(paths) / a.batch_size))
 
-        # area produces a nice downscaling, but does nearest neighbor for upscaling
-        # assume we're going to be doing downscaling here
-        r = tf.image.resize_images(r, [a.scale_size, a.scale_size], method=tf.image.ResizeMethod.AREA)
+        return Examples(
+            paths=paths_batch,
+            inputs=inputs_batch,
+            targets=targets_batch,
+            labels=label_batch,
+            count=len(paths),
+            steps_per_epoch=steps_per_epoch,
+        )
 
-        offset = tf.cast(tf.floor(tf.random_uniform([2], 0, a.scale_size - CROP_SIZE + 1, seed=seed)), dtype=tf.int32)
-        if a.scale_size > CROP_SIZE:
-            r = tf.image.crop_to_bounding_box(r, offset[0], offset[1], CROP_SIZE, CROP_SIZE)
-        elif a.scale_size < CROP_SIZE:
-            raise Exception("scale size cannot be less than crop size")
-        return r
+    if not a.if_y:
+        if a.input_dir is None or not os.path.exists(a.input_dir):
+            raise Exception("input_dir does not exist")
 
-    with tf.name_scope("input_images"):
-        input_images = transform(inputs)
+        input_paths = glob.glob(os.path.join(a.input_dir, "*.jpg"))
+        decode = tf.image.decode_jpeg
+        if len(input_paths) == 0:
+            input_paths = glob.glob(os.path.join(a.input_dir, "*.png"))
+            decode = tf.image.decode_png
 
-    with tf.name_scope("target_images"):
-        target_images = transform(targets)
+        if len(input_paths) == 0:
+            raise Exception("input_dir contains no image files")
 
-    paths_batch, inputs_batch, targets_batch = tf.train.batch([paths, input_images, target_images], batch_size=a.batch_size)
-    steps_per_epoch = int(math.ceil(len(input_paths) / a.batch_size))
+        def get_name(path):
+            name, _ = os.path.splitext(os.path.basename(path))
+            return name
 
-    return Examples(
-        paths=paths_batch,
-        inputs=inputs_batch,
-        targets=targets_batch,
-        count=len(input_paths),
-        steps_per_epoch=steps_per_epoch,
-    )
+        # if the image names are numbers, sort by the value rather than asciibetically
+        # having sorted inputs means that the outputs are sorted in test mode
+        if all(get_name(path).isdigit() for path in input_paths):
+            input_paths = sorted(input_paths, key=lambda path: int(get_name(path)))
+        else:
+            input_paths = sorted(input_paths)
+
+        with tf.name_scope("load_images"):
+            path_queue = tf.train.string_input_producer(input_paths, shuffle=a.mode == "train")
+            reader = tf.WholeFileReader()
+            paths, contents = reader.read(path_queue)
+            raw_input = decode(contents)
+            raw_input = tf.image.convert_image_dtype(raw_input, dtype=tf.float32)
+
+            assertion = tf.assert_equal(tf.shape(raw_input)[2], 3, message="image does not have 3 channels")
+            with tf.control_dependencies([assertion]):
+                raw_input = tf.identity(raw_input)
+
+            raw_input.set_shape([None, None, 3])
+
+            if a.lab_colorization:
+                # load color and brightness from image, no B image exists here
+                lab = rgb_to_lab(raw_input)
+                L_chan, a_chan, b_chan = preprocess_lab(lab)
+                a_images = tf.expand_dims(L_chan, axis=2)
+                b_images = tf.stack([a_chan, b_chan], axis=2)
+            else:
+                # break apart image pair and move to range [-1, 1]
+                width = tf.shape(raw_input)[1] # [height, width, channels]
+                a_images = preprocess(raw_input[:,:width//2,:])
+                b_images = preprocess(raw_input[:,width//2:,:])
+
+        if a.which_direction == "AtoB":
+            inputs, targets = [a_images, b_images]
+        elif a.which_direction == "BtoA":
+            inputs, targets = [b_images, a_images]
+        else:
+            raise Exception("invalid direction")
+
+        # synchronize seed for image operations so that we do the same operations to both
+        # input and output images
+        seed = random.randint(0, 2**31 - 1)
+        def transform(image):
+            r = image
+            if a.flip:
+                r = tf.image.random_flip_left_right(r, seed=seed)
+
+            # area produces a nice downscaling, but does nearest neighbor for upscaling
+            # assume we're going to be doing downscaling here
+            r = tf.image.resize_images(r, [a.scale_size, a.scale_size], method=tf.image.ResizeMethod.AREA)
+
+            offset = tf.cast(tf.floor(tf.random_uniform([2], 0, a.scale_size - CROP_SIZE + 1, seed=seed)), dtype=tf.int32)
+            if a.scale_size > CROP_SIZE:
+                r = tf.image.crop_to_bounding_box(r, offset[0], offset[1], CROP_SIZE, CROP_SIZE)
+            elif a.scale_size < CROP_SIZE:
+                raise Exception("scale size cannot be less than crop size")
+            return r
+
+        with tf.name_scope("input_images"):
+            input_images = transform(inputs)
+
+        with tf.name_scope("target_images"):
+            target_images = transform(targets)
+
+        paths_batch, inputs_batch, targets_batch = tf.train.batch([paths, input_images, target_images], batch_size=a.batch_size)
+        steps_per_epoch = int(math.ceil(len(input_paths) / a.batch_size))
+
+        return Examples(
+            paths=paths_batch,
+            inputs=inputs_batch,
+            targets=targets_batch,
+            count=len(input_paths),
+            steps_per_epoch=steps_per_epoch,
+        )
 
 
 def create_generator(generator_inputs, generator_outputs_channels):
