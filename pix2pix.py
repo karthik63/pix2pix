@@ -14,18 +14,18 @@ import math
 import time
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--input_dir", help="path to folder containing images")
-parser.add_argument("--mode", required=True, choices=["train", "test", "export"])
-parser.add_argument("--output_dir", required=True, help="where to put output files")
-parser.add_argument("--seed", type=int)
+parser.add_argument("--input_dir", default="../combined_images", help="path to folder containing images")
+parser.add_argument("--mode", default="train", required=True, choices=["train", "test", "export"])
+parser.add_argument("--output_dir", default="../output_dir_trial1", required=True, help="where to put output files")
+parser.add_argument("--seed", default=12345, type=int)
 parser.add_argument("--checkpoint", default=None, help="directory with checkpoint to resume training from or use for testing")
 
 parser.add_argument("--max_steps", type=int, help="number of training steps (0 to disable)")
-parser.add_argument("--max_epochs", type=int, help="number of training epochs")
+parser.add_argument("--max_epochs", type=int, default=100, help="number of training epochs")
 parser.add_argument("--summary_freq", type=int, default=100, help="update summaries every summary_freq steps")
 parser.add_argument("--progress_freq", type=int, default=50, help="display progress every progress_freq steps")
 parser.add_argument("--trace_freq", type=int, default=0, help="trace execution every trace_freq steps")
-parser.add_argument("--display_freq", type=int, default=0, help="write current training images every display_freq steps")
+parser.add_argument("--display_freq", type=int, default=100, help="write current training images every display_freq steps")
 parser.add_argument("--save_freq", type=int, default=5000, help="save model every save_freq steps, 0 to disable")
 
 parser.add_argument("--aspect_ratio", type=float, default=1.0, help="aspect ratio of output images (width/height)")
@@ -778,6 +778,16 @@ def save_images(fetches, step=None):
             contents = fetches[kind][i]
             with open(out_path, "wb") as f:
                 f.write(contents)
+
+        filename = name + "-" + "labels" + ".txt"
+        if step is not None:
+            filename = "%08d-%s" % (step, filename)
+        fileset["labels"] = filename
+        out_path = os.path.join(image_dir, filename)
+        contents = fetches["labels"][i]
+        with open(out_path, "w") as f:
+            f.write(str(contents))
+
         filesets.append(fileset)
     return filesets
 
@@ -947,6 +957,7 @@ def main():
 
     with tf.name_scope("encode_images"):
         display_fetches = {
+            "labels": examples.labels,
             "paths": examples.paths,
             "inputs": tf.map_fn(tf.image.encode_png, converted_inputs, dtype=tf.string, name="input_pngs"),
             "targets": tf.map_fn(tf.image.encode_png, converted_targets, dtype=tf.string, name="target_pngs"),
@@ -1052,6 +1063,7 @@ def main():
                     print("saving display images")
                     filesets = save_images(results["display"], step=results["global_step"])
                     append_index(filesets, step=True)
+
 
                 if should(a.trace_freq):
                     print("recording trace")
