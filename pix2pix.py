@@ -12,11 +12,16 @@ import random
 import collections
 import math
 import time
+import top50
+
+# !!! MODE AND OUTPUT DIRECTORY ARE REQUIRED !!!!!!
+# !!! MODE AND OUTPUT DIRECTORY ARE REQUIRED !!!!!!
+# !!! MODE AND OUTPUT DIRECTORY ARE REQUIRED !!!!!!
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--input_dir", default="../combined_images", help="path to folder containing images")
-parser.add_argument("--mode", default="train", required=True, choices=["train", "test", "export"])
-parser.add_argument("--output_dir", default="../output_dir_trial1", required=True, help="where to put output files")
+parser.add_argument("--input_dir", default="../combined_pics", help="path to folder containing images")
+parser.add_argument("--mode", default="train", choices=["train", "test", "export"])
+parser.add_argument("--output_dir", default="../output_dir_trial1", help="where to put output files")
 parser.add_argument("--seed", default=12345, type=int)
 parser.add_argument("--checkpoint", default=None, help="directory with checkpoint to resume training from or use for testing")
 
@@ -30,7 +35,7 @@ parser.add_argument("--save_freq", type=int, default=5000, help="save model ever
 
 parser.add_argument("--aspect_ratio", type=float, default=1.0, help="aspect ratio of output images (width/height)")
 parser.add_argument("--lab_colorization", action="store_true", help="split input image into brightness (A) and color (B)")
-parser.add_argument("--batch_size", type=int, default=1, help="number of images in batch")
+parser.add_argument("--batch_size", type=int, default=20, help="number of images in batch")
 parser.add_argument("--which_direction", type=str, default="AtoB", choices=["AtoB", "BtoA"])
 parser.add_argument("--ngf", type=int, default=64, help="number of generator filters in first conv layer")
 parser.add_argument("--ndf", type=int, default=64, help="number of discriminator filters in first conv layer")
@@ -45,8 +50,9 @@ parser.add_argument("--gan_weight", type=float, default=1.0, help="weight on GAN
 parser.add_argument("--if_y", help="set this option to pass attributes", dest="if_y", action="store_true")
 parser.add_argument("--input_size", help="number of images in input", type=int, default="289222")
 parser.add_argument("--all1000", help="enable to use all 1000 attributes", dest="all1000", action="store_true")
+parser.add_argument("--top_how_many", default=50, help="top how many attributes to use ?", type=int)
 parser.add_argument("--model", help="which model to use", type=str, default="model1")
-parser.set_defaults(if_y=True, all1000=True)
+parser.set_defaults(if_y=True, all1000=False)
 
 # export options
 parser.add_argument("--output_filetype", default="png", choices=["png", "jpeg"])
@@ -58,6 +64,10 @@ CROP_SIZE = 256
 Examples = collections.namedtuple("Examples", "paths, inputs, targets, count, steps_per_epoch, labels")
 Model = collections.namedtuple("Model", "outputs, predict_real, predict_fake, discrim_loss, discrim_grads_and_vars, gen_loss_GAN, gen_loss_L1, gen_grads_and_vars, train")
 
+if a.all1000:
+    attribute_count = 1000
+else:
+    attribute_count = a.top_how_many
 
 def preprocess(image):
     with tf.name_scope("preprocess"):
@@ -264,16 +274,18 @@ def load_paths_and_attributes():
                 path = str(line[0])
                 path = path.strip().split('/')
                 path = path[1] + '-' + path[2]
-                attr = np.array(line[1:1001], dtype=np.int8)
+                attr = np.array(line[1:1001], dtype=np.int32)
 
                 paths.append(path)
                 attributes[index - 2] = attr
 
             index += 1
 
-        attributes = np.array(attributes, dtype=np.int8)
+        attributes = np.array(attributes, dtype=np.int32)
         attributes += 1
         attributes //= 2
+
+        attributes = tf.constant(attributes)
 
         return paths, attributes
 
@@ -283,14 +295,22 @@ def load_examples():
         if a.input_dir is None or not os.path.exists(a.input_dir):
             raise Exception("input_dir does not exist")
 
-        paths, attributes = load_paths_and_attributes()
-        
+        if a.all1000:
+            paths, attributes = load_paths_and_attributes()
+
+        else:
+            paths, attributes = top50.load_paths_and_attributes(a, a.top_how_many)
+
         queue = tf.train.slice_input_producer([paths, attributes], shuffle=a.mode == "train")
 
         label = queue[1]
         image_path = queue[0]
 
-        image_tensor = tf.image.decode_jpeg(image_path)
+        image_tensor = tf.image.decode_png(tf.read_file(image_path))
+
+        image_tensor = tf.image.convert_image_dtype(image_tensor, tf.float32);
+
+        image_path = tf.reshape(queue[0], shape=[1])
 
         if a.lab_colorization:
             # load color and brightness from image, no B image exists here
@@ -312,20 +332,28 @@ def load_examples():
         else:
             raise Exception("invalid direction")
 
+        inputs = tf.reshape(inputs, [CROP_SIZE, CROP_SIZE, 3])
+        targets = tf.reshape(targets, [CROP_SIZE, CROP_SIZE, 3])
+        label = tf.cast(tf.reshape(label, [attribute_count]), tf.float32)
+
         paths_batch, inputs_batch, targets_batch, label_batch = tf.train.batch([image_path, inputs, targets, label],
-                                                                  batch_size=a.batch_size)
+                                                                               batch_size=a.batch_size,
+                                                                               shapes=[[1],
+                                                                                       [CROP_SIZE, CROP_SIZE, 3],
+                                                                                       [CROP_SIZE, CROP_SIZE, 3],
+                                                                                       [attribute_count]])
         steps_per_epoch = int(math.ceil(len(paths) / a.batch_size))
 
         return Examples(
+            labels=label_batch,
             paths=paths_batch,
             inputs=inputs_batch,
             targets=targets_batch,
-            labels=label_batch,
             count=len(paths),
             steps_per_epoch=steps_per_epoch,
         )
 
-    if not a.if_y:
+    else:
         if a.input_dir is None or not os.path.exists(a.input_dir):
             raise Exception("input_dir does not exist")
 
@@ -418,6 +446,7 @@ def load_examples():
         )
 
 def conv_cond_concat(x, y):
+    y = tf.reshape(y, [a.batch_size,1,1,attribute_count])
     x_shape = x.get_shape()
     y_shape = y.get_shape()
 
@@ -701,7 +730,7 @@ def create_model(inputs, targets, labels):
 
     with tf.variable_scope("generator") as scope:
         out_channels = int(targets.get_shape()[-1])
-        outputs = create_generator(inputs, out_channels)
+        outputs = create_generator(inputs, out_channels, labels)
 
     # create two copies of discriminator, one for real pairs and one for fake pairs
     # they share the same underlying variables
@@ -767,7 +796,11 @@ def save_images(fetches, step=None):
 
     filesets = []
     for i, in_path in enumerate(fetches["paths"]):
-        name, _ = os.path.splitext(os.path.basename(in_path.decode("utf8")))
+        if a.if_y:
+            print(in_path[0])
+            name, _ = os.path.splitext(os.path.basename(in_path[0].decode("utf8")))
+        else:
+            name, _ = os.path.splitext(os.path.basename(in_path.decode("utf8")))
         fileset = {"name": name, "step": step}
         for kind in ["inputs", "outputs", "targets"]:
             filename = name + "-" + kind + ".png"
@@ -909,8 +942,10 @@ def main():
 
         return
 
+    print("BBBBBBBBFFFFFORE LOADING")
     examples = load_examples()
     print("examples count = %d" % examples.count)
+    print("AFTER LOAAAAAAAAAAADIIIIIIIIIIIING")
 
     # inputs and targets are [batch_size, height, width, channels]
     model = create_model(examples.inputs, examples.targets, examples.labels)
@@ -1027,7 +1062,10 @@ def main():
             # training
             start = time.time()
 
+            print("before steps")
+
             for step in range(max_steps):
+
                 def should(freq):
                     return freq > 0 and ((step + 1) % freq == 0 or step == max_steps - 1)
 
