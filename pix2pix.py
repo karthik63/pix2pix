@@ -20,11 +20,11 @@ import top50
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--input_dir", default="../combined_pics", help="path to folder containing images")
-parser.add_argument("--mode", default="train", choices=["train", "test", "export"])
+parser.add_argument("--mode", default="", choices=["train", "test", "export"])
 parser.add_argument("--output_dir", default="../output_dir_trial1", help="where to put output files")
 parser.add_argument("--seed", default=12345, type=int)
 parser.add_argument("--checkpoint", default=None, help="directory with checkpoint to resume training from or use for testing")
-
+parser.add_argument("--test_dir", default='../test_dir', help='files to test')
 parser.add_argument("--max_steps", type=int, help="number of training steps (0 to disable)")
 parser.add_argument("--max_epochs", type=int, default=100, help="number of training epochs")
 parser.add_argument("--summary_freq", type=int, default=100, help="update summaries every summary_freq steps")
@@ -563,6 +563,75 @@ def create_generator(generator_inputs, generator_outputs_channels, generator_lab
         ]
 
         num_encoder_layers = len(layers)
+        for decoder_layer, (out_channels, dropout) in enumerate(layer_specs):
+            skip_layer = num_encoder_layers - decoder_layer - 1
+            with tf.variable_scope("decoder_%d" % (skip_layer + 1)):
+                if decoder_layer == 0:
+                    # first decoder layer doesn't have skip connections
+                    # since it is directly connected to the skip_layer
+                    input = layers[-1]
+                else:
+                    input = tf.concat([layers[-1], layers[skip_layer]], axis=3)
+
+                rectified = tf.nn.relu(input)
+                # [batch, in_height, in_width, in_channels] => [batch, in_height*2, in_width*2, out_channels]
+                output = deconv(rectified, out_channels)
+                output = batchnorm(output)
+
+                if dropout > 0.0:
+                    output = tf.nn.dropout(output, keep_prob=1 - dropout)
+
+                layers.append(output)
+
+        # decoder_1: [batch, 128, 128, ngf * 2] => [batch, 256, 256, generator_outputs_channels]
+        with tf.variable_scope("decoder_1"):
+            input = tf.concat([layers[-1], layers[0]], axis=3)
+            rectified = tf.nn.relu(input)
+            output = deconv(rectified, generator_outputs_channels)
+            output = tf.tanh(output)
+            layers.append(output)
+
+        return layers[-1]
+
+    if a.if_y and a.model == "model3":
+        layers = []
+
+        with tf.variable_scope("encoder_1"):
+            output = conv(generator_inputs, a.ngf, stride=2)
+            layers.append(output)
+
+        layer_specs = [
+            a.ngf * 2,  # encoder_2: [batch, 128, 128, ngf] => [batch, 64, 64, ngf * 2]
+            a.ngf * 4,  # encoder_3: [batch, 64, 64, ngf * 2] => [batch, 32, 32, ngf * 4]
+            a.ngf * 8,  # encoder_4: [batch, 32, 32, ngf * 4] => [batch, 16, 16, ngf * 8]
+            a.ngf * 8,  # encoder_5: [batch, 16, 16, ngf * 8] => [batch, 8, 8, ngf * 8]
+            a.ngf * 8,  # encoder_6: [batch, 8, 8, ngf * 8] => [batch, 4, 4, ngf * 8]
+            a.ngf * 8,  # encoder_7: [batch, 4, 4, ngf * 8] => [batch, 2, 2, ngf * 8]
+            a.ngf * 8,  # encoder_8: [batch, 2, 2, ngf * 8] => [batch, 1, 1, ngf * 8]
+        ]
+
+        for out_channels in layer_specs:
+            with tf.variable_scope("encoder_%d" % (len(layers) + 1)):
+                rectified = lrelu(layers[-1], 0.2)
+                # [batch, in_height, in_width, in_channels] => [batch, in_height/2, in_width/2, out_channels]
+                convolved = conv(rectified, out_channels, stride=2)
+                output = batchnorm(convolved)
+                layers.append(output)
+
+        layer_specs = [
+            (a.ngf * 8, 0.5),  # decoder_8: [batch, 1, 1, ngf * 8] => [batch, 2, 2, ngf * 8 * 2]
+            (a.ngf * 8, 0.5),  # decoder_7: [batch, 2, 2, ngf * 8 * 2] => [batch, 4, 4, ngf * 8 * 2]
+            (a.ngf * 8, 0.5),  # decoder_6: [batch, 4, 4, ngf * 8 * 2] => [batch, 8, 8, ngf * 8 * 2]
+            (a.ngf * 8, 0.0),  # decoder_5: [batch, 8, 8, ngf * 8 * 2] => [batch, 16, 16, ngf * 8 * 2]
+            (a.ngf * 4, 0.0),  # decoder_4: [batch, 16, 16, ngf * 8 * 2] => [batch, 32, 32, ngf * 4 * 2]
+            (a.ngf * 2, 0.0),  # decoder_3: [batch, 32, 32, ngf * 4 * 2] => [batch, 64, 64, ngf * 2 * 2]
+            (a.ngf, 0.0),  # decoder_2: [batch, 64, 64, ngf * 2 * 2] => [batch, 128, 128, ngf * 2]
+        ]
+
+        num_encoder_layers = len(layers)
+
+        layers[-1] = conv_cond_concat(layers[-1], generator_labels)
+
         for decoder_layer, (out_channels, dropout) in enumerate(layer_specs):
             skip_layer = num_encoder_layers - decoder_layer - 1
             with tf.variable_scope("decoder_%d" % (skip_layer + 1)):

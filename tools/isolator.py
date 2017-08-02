@@ -14,8 +14,11 @@ import time
 
 def load_paths_and_attributes(a, top_how_many):
 
+    print("aay")
 
     with open(os.path.join(a.input_dir, 'Anno/list_attr_img.txt'), 'rb') as attributes_file:
+
+        print("aay")
 
         def get_lines(a):
             for l in a:
@@ -29,7 +32,13 @@ def load_paths_and_attributes(a, top_how_many):
 
         index = 0
 
+        k = 0
+
         for line in line_gen:
+
+            k += 1
+
+            print(k)
 
             # print(index)
 
@@ -77,7 +86,7 @@ def load_paths_and_attributes(a, top_how_many):
         top_attributes = [x[0] for x in image_count_sorted[0:top_how_many]]
         all_attr = list(range(1000))
         attributes_to_del = [x for x in all_attr if x not in top_attributes]
-        attributes = np.delete(attributes, attributes_to_del, axis=1)
+        new_attributes = np.delete(attributes, attributes_to_del, axis=1)
 
     with open(os.path.join(a.input_dir, 'Anno/list_attr_cloth.txt'), 'rb') as attributes_list:
 
@@ -103,7 +112,6 @@ def load_paths_and_attributes(a, top_how_many):
         print(attribute_names)
 
         print([(x, attribute_names[x]) for x in top_attributes])
-        attributes = tf.constant(attributes)
 
         def gen_samples():
 
@@ -111,6 +119,8 @@ def load_paths_and_attributes(a, top_how_many):
                 os.makedirs('/home/sam/Desktop/samples_for_attributes')
 
             for j in range(top_how_many):
+
+                print("aaaaaay " + str(j))
 
                 count = 0
 
@@ -123,22 +133,30 @@ def load_paths_and_attributes(a, top_how_many):
 
                         if attributes[k][top_attributes[j]]:
 
-                            dest_path = os.path.join('/home/sam/Desktop/samples_for_attributes', attribute_names[j])
+                            if not os.path.exists(os.path.join(a.input_dir, paths[k])):
+                                continue
+
+                            dest_path = os.path.join('/home/sam/Desktop/samples_for_attributes', attribute_names[top_attributes[j]])
 
                             if not os.path.exists(dest_path):
                                 os.makedirs(dest_path)
 
-                            copyfile(os.path.join(a.input_dir, paths[k]), dest_path)
+                            copyfile(paths[k], os.path.join(dest_path, os.path.basename(paths[k])))
+                            with open(os.path.join(dest_path, os.path.basename(paths[k]))[:-3] + '.txt', 'w') as file:
+                                file.write(str(new_attributes[k]))
 
                             count += 1
 
+        gen_samples()
+        
 
-        return paths, attributes
+        attributes = tf.constant(new_attributes)
+        return paths, new_attributes
 
 
 class Tub:
     def __init__(self):
-        self.input_dir = '/home/sam/Desktop/gan/fashion_clothing_and_category'
+        self.input_dir = '/home/sam/combined_pics'
         self.input_size = 289222
 
 a = Tub()
